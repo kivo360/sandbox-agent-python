@@ -1,8 +1,8 @@
 """Modal provider — Modal.com sandbox integration.
 
-Uses the modal SDK's real API surface (modal.App, modal.Sandbox,
-modal.Image, modal.Secret, modal.Tunnel). Sync modal calls are wrapped
-with asyncio.to_thread so the provider is safe to call from async code.
+Uses the modal SDK's native async API (``.aio()`` variants) for every
+remote call. ``modal.Image.from_registry`` and ``modal.Secret.from_dict``
+are local builders (no remote work) and remain sync.
 
 The default image is ``rivetdev/sandbox-agent:<version>-full`` which already
 ships the sandbox-agent server binary — no install step needed.
@@ -10,7 +10,6 @@ ships the sandbox-agent server binary — no install step needed.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 from typing import Any, Callable
 
@@ -58,6 +57,7 @@ class ModalProvider(SandboxProvider):
         self.options = options or ModalProviderOptions()
         self.agent_port = self.options.agent_port or DEFAULT_AGENT_PORT
         self.app_name = self.options.app_name or DEFAULT_APP_NAME
+        self.sandbox_id: str | None = None
 
         try:
             import modal  # noqa: F401
@@ -97,48 +97,47 @@ class ModalProvider(SandboxProvider):
         if env_vars:
             secrets.append(modal.Secret.from_dict(env_vars))
 
-        app = await asyncio.to_thread(
-            modal.App.lookup, self.app_name, create_if_missing=True
-        )
+        app = await modal.App.lookup.aio(self.app_name, create_if_missing=True)
 
         extra_ports = create_opts.get("encrypted_ports") or []
-        memory_mib = create_opts.get("memory_mib", DEFAULT_MEMORY_MIB)
+        # Modal's actual param name is `memory` (MiB int); we accept the
+        # more explicit `memory_mib` alias in create_opts for callers.
+        memory = create_opts.get("memory_mib") or create_opts.get("memory") or DEFAULT_MEMORY_MIB
         timeout = create_opts.get("timeout", DEFAULT_TIMEOUT_SECONDS)
         volumes = create_opts.get("volumes") or {}
 
-        sandbox = await asyncio.to_thread(
-            lambda: modal.Sandbox.create(
-                "sandbox-agent",
-                "server",
-                "--no-token",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.agent_port),
-                app=app,
-                image=image,
-                secrets=secrets,
-                volumes=volumes,
-                encrypted_ports=[self.agent_port, *extra_ports],
-                memory_mib=memory_mib,
-                timeout=timeout,
-            )
+        sandbox = await modal.Sandbox.create.aio(
+            "sandbox-agent",
+            "server",
+            "--no-token",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self.agent_port),
+            app=app,
+            image=image,
+            secrets=secrets,
+            volumes=volumes,
+            encrypted_ports=[self.agent_port, *extra_ports],
+            memory=memory,
+            timeout=timeout,
         )
+        self.sandbox_id = sandbox.object_id
         return sandbox.object_id
 
     async def destroy(self, sandbox_id: str) -> None:
         """Terminate the Modal sandbox."""
         import modal
 
-        sandbox = modal.Sandbox.from_id(sandbox_id)
-        await asyncio.to_thread(sandbox.terminate)
+        sandbox = await modal.Sandbox.from_id.aio(sandbox_id)
+        await sandbox.terminate.aio()
 
     async def get_url(self, sandbox_id: str) -> str:
         """Return the public tunnel URL for the sandbox-agent server port."""
         import modal
 
-        sandbox = modal.Sandbox.from_id(sandbox_id)
-        tunnels = await asyncio.to_thread(sandbox.tunnels)
+        sandbox = await modal.Sandbox.from_id.aio(sandbox_id)
+        tunnels = await sandbox.tunnels.aio()
         tunnel = tunnels.get(self.agent_port)
         if tunnel is None:
             raise RuntimeError(
@@ -154,7 +153,7 @@ class ModalProvider(SandboxProvider):
         """
         import modal
 
-        await asyncio.to_thread(modal.Sandbox.from_id, sandbox_id)
+        await modal.Sandbox.from_id.aio(sandbox_id)
 
     async def ensure_server(self, sandbox_id: str) -> None:
         """Restart sandbox-agent server inside an existing sandbox.
@@ -166,17 +165,15 @@ class ModalProvider(SandboxProvider):
         """
         import modal
 
-        sandbox = modal.Sandbox.from_id(sandbox_id)
-        await asyncio.to_thread(
-            lambda: sandbox.exec(
-                "sandbox-agent",
-                "server",
-                "--no-token",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                str(self.agent_port),
-            )
+        sandbox = await modal.Sandbox.from_id.aio(sandbox_id)
+        await sandbox.exec.aio(
+            "sandbox-agent",
+            "server",
+            "--no-token",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(self.agent_port),
         )
 
     async def _resolve_create_options(
