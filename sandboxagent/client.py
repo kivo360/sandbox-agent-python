@@ -390,13 +390,17 @@ class Session:
             AcpRpcError: If the prompt fails.
         """
         acp = self._ensure_acp()
+        # ACP `prompt` is an array of content parts (TS shape:
+        # `[{type: "text", text: "..."}]`). The Python convenience signature
+        # accepts a plain string and wraps it; advanced callers can pass a
+        # pre-built list via `attachments` or call acp.prompt() directly.
+        prompt_parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if attachments:
+            prompt_parts.extend(attachments)
         request: PromptRequest = {
             "sessionId": self._record.agent_session_id,
-            "prompt": prompt,
-            "streaming": streaming,
+            "prompt": prompt_parts,
         }
-        if attachments:
-            request["attachments"] = attachments
         return await acp.prompt(request)
 
     # --- Process Terminal ---
@@ -1901,6 +1905,7 @@ class SandboxAgent:
         acp_client = AcpHttpClient(
             base_url=self._base_url,
             server_id=server_id,
+            agent=agent,
             token=self._token,
             headers=self._headers,
             on_message=_dispatch_message,
@@ -1913,14 +1918,29 @@ class SandboxAgent:
         await acp_client.connect()
         await acp_client.initialize()
 
-        # Create session via ACP
-        new_session_response = await acp_client.new_session({"agent": agent})
+        # Create session via ACP. opencode (and likely other agents) require
+        # `cwd` and `mcpServers` in session/new params — verified empirically
+        # via direct curl probe 2026-04-26 against sandbox-agent server. The
+        # SDK supplies sensible defaults; callers can override later via
+        # session.set_*() methods.
+        new_session_response = await acp_client.new_session({
+            "agent": agent,
+            "cwd": "/root",
+            "mcpServers": [],
+        })
 
-        # Build session record
+        # Build session record. Server returns `sessionId` (e.g.
+        # `ses_2344925c4ffetm4VhbFOJyv3Ej`); older versions returned
+        # `agentSessionId` separately. Try both for compatibility.
+        agent_sid = (
+            new_session_response.get("sessionId")
+            or new_session_response.get("agentSessionId")
+            or ""
+        )
         record = SessionRecord(
             id=local_session_id,
             agent=agent,
-            agent_session_id=new_session_response.get("agentSessionId", ""),
+            agent_session_id=agent_sid,
             last_connection_id=server_id,
             created_at=int(time.time()),
             destroyed_at=None,

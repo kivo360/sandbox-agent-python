@@ -21,7 +21,11 @@ from sandboxagent.types import ProblemDetails
 logger = logging.getLogger(__name__)
 
 DEFAULT_ACP_PATH = "/v1/acp"
-PROTOCOL_VERSION = "2025-03-18"
+# ACP protocol revision number. The server validates this as an integer
+# (zod number schema). The string `"2025-03-18"` was the date label of the
+# protocol but is not the wire value — Rust/TS SDKs send the integer
+# revision (currently 1). Verified via direct curl probe 2026-04-26.
+PROTOCOL_VERSION = 1
 
 
 class AcpHttpError(Exception):
@@ -245,6 +249,7 @@ class AcpHttpClient:
         base_url: str,
         server_id: str,
         *,
+        agent: str | None = None,
         token: str | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = 30.0,
@@ -258,6 +263,10 @@ class AcpHttpClient:
         Args:
             base_url: Base URL of the sandbox-agent server.
             server_id: ID of the ACP server instance to connect to.
+            agent: Agent type for this server (e.g. "claude", "codex",
+                "opencode"). Required by the server on the first POST to
+                /v1/acp/{server_id} as a query parameter to bootstrap the
+                ACP runtime; ignored on subsequent requests.
             token: Optional bearer token for authentication.
             headers: Optional additional HTTP headers.
             timeout: HTTP request timeout in seconds.
@@ -268,6 +277,8 @@ class AcpHttpClient:
         """
         self._base_url = base_url.rstrip("/")
         self._server_id = server_id
+        self._agent = agent
+        self._first_post_sent = False
         self._token = token
         self._timeout = timeout
         self._closed = False
@@ -623,13 +634,25 @@ class AcpHttpClient:
             "Accept": "application/json",
         })
 
+        # The server requires `?agent=<name>` on the first POST to
+        # /v1/acp/{server_id} to bootstrap the ACP runtime for that agent
+        # type. Subsequent requests reuse the runtime and don't need it.
+        post_params: dict[str, str] | None = None
+        if not self._first_post_sent and self._agent:
+            post_params = {"agent": self._agent}
+
         try:
             response = await self._client.post(
                 self._build_url(),
                 headers=headers,
                 json=message,
+                params=post_params,
                 timeout=self._timeout,
             )
+            # Mark the first POST as done once we get any response from the
+            # server (including errors) — retrying with ?agent= twice
+            # would cause the server to reject the second one.
+            self._first_post_sent = True
 
             if response.status_code >= 400:
                 problem = None
@@ -776,9 +799,10 @@ class AcpHttpClient:
         """
         params: InitializeRequest = {
             "protocolVersion": PROTOCOL_VERSION,
+            "clientCapabilities": {},
             "clientInfo": {
                 "name": "sandboxagent-python",
-                "version": "0.1.5",
+                "version": "0.2.0",
             },
         }
         if request:
@@ -814,7 +838,7 @@ class AcpHttpClient:
         Returns:
             The new session response with session IDs.
         """
-        result = await self._send_request("session/create", cast(dict[str, Any], request))
+        result = await self._send_request("session/new", cast(dict[str, Any], request))
 
         # Store session ID mapping
         local_id = result.get("sessionId")
