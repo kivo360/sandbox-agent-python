@@ -1,7 +1,17 @@
-"""Modal provider — Modal.com serverless GPU integration."""
+"""Modal provider — Modal.com sandbox integration.
+
+Uses the modal SDK's real API surface (modal.App, modal.Sandbox,
+modal.Image, modal.Secret, modal.Tunnel). Sync modal calls are wrapped
+with asyncio.to_thread so the provider is safe to call from async code.
+
+The default image is ``rivetdev/sandbox-agent:<version>-full`` which already
+ships the sandbox-agent server binary — no install step needed.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from typing import Any, Callable
 
 from sandboxagent.providers.types import SandboxProvider
@@ -10,15 +20,22 @@ from sandboxagent.providers.shared import DEFAULT_SANDBOX_AGENT_IMAGE
 DEFAULT_AGENT_PORT = 3000
 DEFAULT_APP_NAME = "sandbox-agent"
 DEFAULT_MEMORY_MIB = 2048
+DEFAULT_TIMEOUT_SECONDS = 60 * 60
 
 
 class ModalProviderOptions:
     """Options for the Modal provider.
 
     Attributes:
-        create: Overrides for sandbox creation options.
-        image: Docker image to use (string or Modal Image object).
-        agent_port: Port for the sandbox-agent server.
+        create: Per-sandbox overrides — secrets dict, encrypted_ports list,
+            memory_mib, timeout. May be a dict, a callable, or an async
+            callable.
+        image: Docker image to use. String → ``modal.Image.from_registry``.
+            ``modal.Image`` instance → used as-is.
+        agent_port: Port the sandbox-agent server listens on inside the
+            sandbox. Defaults to 3000.
+        app_name: Modal App name (created if missing). Defaults to
+            ``"sandbox-agent"``.
     """
 
     def __init__(
@@ -26,10 +43,12 @@ class ModalProviderOptions:
         create: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
         image: str | Any | None = None,
         agent_port: int | None = None,
+        app_name: str | None = None,
     ) -> None:
         self.create = create
         self.image = image
         self.agent_port = agent_port
+        self.app_name = app_name
 
 
 class ModalProvider(SandboxProvider):
@@ -38,12 +57,15 @@ class ModalProvider(SandboxProvider):
     def __init__(self, options: ModalProviderOptions | None = None) -> None:
         self.options = options or ModalProviderOptions()
         self.agent_port = self.options.agent_port or DEFAULT_AGENT_PORT
+        self.app_name = self.options.app_name or DEFAULT_APP_NAME
 
         try:
-            from modal import ModalClient
-            self._client = ModalClient()
-        except ImportError:
-            raise ImportError("modal provider requires 'modal' package. Install with: pip install modal")
+            import modal  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "modal provider requires the 'modal' package. "
+                "Install with: pip install modal"
+            ) from exc
 
     @property
     def name(self) -> str:
@@ -54,74 +76,115 @@ class ModalProvider(SandboxProvider):
         return "/root"
 
     async def create(self) -> str:
-        """Create a new Modal sandbox."""
-        from modal import SandboxCreateParams
+        """Provision a Modal sandbox running sandbox-agent server.
+
+        Returns the Modal sandbox object_id, which doubles as the sandbox_id
+        the SDK uses for subsequent destroy/get_url/ensure_server calls.
+        """
+        import modal
 
         create_opts = await self._resolve_create_options(self.options.create)
-        app_name = create_opts.get("app_name", DEFAULT_APP_NAME)
         base_image = self.options.image or DEFAULT_SANDBOX_AGENT_IMAGE
-
-        app = await self._client.apps.from_name(app_name, create_if_missing=True)
-
-        # The default `-full` base image already includes sandbox-agent
         if isinstance(base_image, str):
-            image = self._client.images.from_registry(base_image)
+            image = modal.Image.from_registry(base_image)
         else:
             image = base_image
 
-        env_vars = create_opts.get("secrets", {})
+        env_vars = dict(create_opts.get("secrets") or {})
         if self.env:
             env_vars = {**env_vars, **self.env}
-        secrets = []
+        secrets: list = []
         if env_vars:
-            secrets.append(await self._client.secrets.from_object(env_vars))
+            secrets.append(modal.Secret.from_dict(env_vars))
 
-        # Extract Modal-specific options
-        sandbox_create_opts = {k: v for k, v in create_opts.items() if k not in ("app_name", "secrets", "encrypted_ports")}
-        extra_ports = create_opts.get("encrypted_ports", [])
-
-        sb = await self._client.sandboxes.create(
-            app,
-            image,
-            encrypted_ports=[self.agent_port, *extra_ports],
-            secrets=secrets,
-            memory_mib=sandbox_create_opts.get("memory_mib", DEFAULT_MEMORY_MIB),
-            **sandbox_create_opts,
+        app = await asyncio.to_thread(
+            modal.App.lookup, self.app_name, create_if_missing=True
         )
 
-        # Start the server as a long-running exec process
-        sb.exec(["sandbox-agent", "server", "--no-token", "--host", "0.0.0.0", "--port", str(self.agent_port)])
+        extra_ports = create_opts.get("encrypted_ports") or []
+        memory_mib = create_opts.get("memory_mib", DEFAULT_MEMORY_MIB)
+        timeout = create_opts.get("timeout", DEFAULT_TIMEOUT_SECONDS)
+        volumes = create_opts.get("volumes") or {}
 
-        return sb.sandbox_id
+        sandbox = await asyncio.to_thread(
+            lambda: modal.Sandbox.create(
+                "sandbox-agent",
+                "server",
+                "--no-token",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(self.agent_port),
+                app=app,
+                image=image,
+                secrets=secrets,
+                volumes=volumes,
+                encrypted_ports=[self.agent_port, *extra_ports],
+                memory_mib=memory_mib,
+                timeout=timeout,
+            )
+        )
+        return sandbox.object_id
 
     async def destroy(self, sandbox_id: str) -> None:
         """Terminate the Modal sandbox."""
-        sb = await self._client.sandboxes.from_id(sandbox_id)
-        await sb.terminate()
+        import modal
+
+        sandbox = modal.Sandbox.from_id(sandbox_id)
+        await asyncio.to_thread(sandbox.terminate)
 
     async def get_url(self, sandbox_id: str) -> str:
-        """Get the URL for the Modal sandbox."""
-        sb = await self._client.sandboxes.from_id(sandbox_id)
-        tunnels = await sb.tunnels()
+        """Return the public tunnel URL for the sandbox-agent server port."""
+        import modal
+
+        sandbox = modal.Sandbox.from_id(sandbox_id)
+        tunnels = await asyncio.to_thread(sandbox.tunnels)
         tunnel = tunnels.get(self.agent_port)
-        if not tunnel:
-            raise RuntimeError(f"modal: no tunnel found for port {self.agent_port}")
+        if tunnel is None:
+            raise RuntimeError(
+                f"modal: no tunnel for port {self.agent_port} on sandbox {sandbox_id}"
+            )
         return tunnel.url
 
+    async def reconnect(self, sandbox_id: str) -> None:
+        """Re-attach to an existing sandbox via Sandbox.from_id().
+
+        Modal sandboxes outlive a single replica — calling from_id() in a
+        new process binds to the same running sandbox without recreating it.
+        """
+        import modal
+
+        await asyncio.to_thread(modal.Sandbox.from_id, sandbox_id)
+
     async def ensure_server(self, sandbox_id: str) -> None:
-        """Ensure the sandbox-agent server is running."""
-        sb = await self._client.sandboxes.from_id(sandbox_id)
-        sb.exec(["sandbox-agent", "server", "--no-token", "--host", "0.0.0.0", "--port", str(self.agent_port)])
+        """Restart sandbox-agent server inside an existing sandbox.
+
+        Used when the SDK detects a stale connection and wants to recover
+        without recreating the sandbox. Idempotent — if the server is
+        already running, the new exec process simply duplicates it (Modal
+        does not deduplicate concurrent execs).
+        """
+        import modal
+
+        sandbox = modal.Sandbox.from_id(sandbox_id)
+        await asyncio.to_thread(
+            lambda: sandbox.exec(
+                "sandbox-agent",
+                "server",
+                "--no-token",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(self.agent_port),
+            )
+        )
 
     async def _resolve_create_options(
         self, value: dict[str, Any] | Callable[[], dict[str, Any]] | None
     ) -> dict[str, Any]:
-        """Resolve create options that may be a function or dict."""
         if value is None:
             return {}
         if callable(value):
-            import inspect
-
             if inspect.iscoroutinefunction(value):
                 return await value()
             return value()
