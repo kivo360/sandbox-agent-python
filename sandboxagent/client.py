@@ -12,7 +12,7 @@ import logging
 import time
 import uuid
 
-from sandboxagent.persistence import InMemorySessionPersistDriver
+from sandboxagent.persistence import InMemorySessionPersistDriver, SessionPersistDriver
 
 from sandboxagent.acp import (
     AcpHttpClient,
@@ -648,6 +648,8 @@ class SandboxAgent:
         token: str | None = None,
         headers: dict[str, str] | None = None,
         skip_health_check: bool = False,
+        *,
+        persistence: SessionPersistDriver | None = None,
     ) -> None:
         """Initialize the SandboxAgent client.
 
@@ -656,6 +658,8 @@ class SandboxAgent:
             token: Optional authentication token.
             headers: Optional additional headers to include in requests.
             skip_health_check: If True, skip the initial health check.
+            persistence: Optional SessionPersistDriver implementation for durable
+                session storage. Defaults to InMemorySessionPersistDriver().
         """
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -666,7 +670,7 @@ class SandboxAgent:
             token=token,
             headers=self._headers,
         )
-        self._persistence = InMemorySessionPersistDriver()
+        self._persistence: SessionPersistDriver = persistence if persistence is not None else InMemorySessionPersistDriver()
         self._active_sessions: dict[str, Session] = {}
         self._provider: SandboxProvider | None = None
         self._event_listeners: dict[str, set[Callable[[dict[str, Any]], None]]] = {}
@@ -707,6 +711,8 @@ class SandboxAgent:
         headers: dict[str, str] | None = None,
         skip_health_check: bool = False,
         health_timeout: float = 15.0,
+        *,
+        persistence: SessionPersistDriver | None = None,
     ) -> SandboxAgent:
         """Connect to a SandboxAgent server.
 
@@ -716,11 +722,13 @@ class SandboxAgent:
             headers: Optional additional headers to include in requests.
             skip_health_check: If True, skip the initial health check.
             health_timeout: Maximum time in seconds to wait for health check.
+            persistence: Optional SessionPersistDriver for durable session
+                storage. Defaults to InMemorySessionPersistDriver().
 
         Returns:
             A connected SandboxAgent instance.
         """
-        agent = cls(base_url, token, headers, skip_health_check)
+        agent = cls(base_url, token, headers, skip_health_check, persistence=persistence)
         if not skip_health_check:
             await agent.wait_for_health(timeout_seconds=health_timeout)
         return agent
@@ -732,6 +740,7 @@ class SandboxAgent:
         provider: SandboxProvider | None = None,
         workspace_files: dict[str, str] | None = None,
         workspace_env: dict[str, str] | None = None,
+        persistence: SessionPersistDriver | None = None,
         **kwargs: Any,
     ) -> SandboxAgent:
         """Start a new sandbox agent instance.
@@ -744,6 +753,9 @@ class SandboxAgent:
             provider: Optional SandboxProvider for provider-based startup.
             workspace_files: Optional dictionary of filename -> content to write to workspace.
             workspace_env: Optional dictionary of environment variables to inject.
+            persistence: Optional SessionPersistDriver for durable session
+                storage. Defaults to InMemorySessionPersistDriver(). Forwarded
+                to spawn_sandbox_agent in local-spawn mode.
             **kwargs: Additional arguments. For local spawn, passed to spawn_sandbox_agent.
 
         Returns:
@@ -769,6 +781,7 @@ class SandboxAgent:
                 token=token,
                 headers=headers,
                 skip_health_check=skip_health_check,
+                persistence=persistence,
             )
             agent._provider = provider
 
@@ -785,6 +798,8 @@ class SandboxAgent:
 
         # Local spawn mode
         from sandboxagent.spawn import spawn_sandbox_agent
+        if persistence is not None:
+            kwargs.setdefault("persistence", persistence)
         return await spawn_sandbox_agent(**kwargs)
 
     async def _bootstrap_workspace(

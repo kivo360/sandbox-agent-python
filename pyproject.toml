@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sandbox-agent-sdk"
-version = "0.1.5"
+version = "0.2.0"
 description = "Python client SDK for Sandbox Agent — universal API for automatic coding agents in sandboxes"
 readme = "README.md"
 license = { text = "Apache-2.0" }

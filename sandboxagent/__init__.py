@@ -45,7 +45,7 @@ try:
 except ImportError:
     DesktopStreamSession = None  # type: ignore[misc,assignment]
 from sandboxagent.inspector import build_inspector_url
-from sandboxagent.persistence import InMemorySessionPersistDriver
+from sandboxagent.persistence import InMemorySessionPersistDriver, ListPage, SessionPersistDriver
 from sandboxagent.live_acp import LiveAcpConnection
 from sandboxagent.spawn import (
     SandboxAgentSpawnHandle,
@@ -65,9 +65,9 @@ __all__ = [
     "GitCloneError",
 
     "InMemorySessionPersistDriver",
+    "ListPage",
     "LiveAcpConnection",
 
-    "InMemorySessionPersistDriver",
     "InitializeRequest",
     "InitializeResponse",
     "ListSessionsRequest",
@@ -87,6 +87,7 @@ __all__ = [
     "SandboxAgentSpawnOptions",
     "SandboxDestroyedError",
     "Session",
+    "SessionPersistDriver",
     "SetSessionConfigOptionRequest",
     "SetSessionConfigOptionResponse",
     "SetSessionModeRequest",
@@ -100,4 +101,4 @@ __all__ = [
     "spawn_sandbox_agent",
 ]
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"

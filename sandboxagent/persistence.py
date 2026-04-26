@@ -6,7 +6,7 @@ import asyncio
 import copy
 import json
 from collections.abc import Callable
-from typing import Generic, TypeVar
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 from sandboxagent.types import SessionEvent, SessionRecord
 
@@ -25,6 +25,39 @@ class ListPage(Generic[T]):
     def __init__(self, items: list[T], next_cursor: str | None = None) -> None:
         self.items = items
         self.next_cursor = next_cursor
+
+
+@runtime_checkable
+class SessionPersistDriver(Protocol):
+    """Protocol for session persistence backends.
+
+    Mirrors the canonical TypeScript SessionPersistDriver interface. All methods
+    are async. Pagination uses offset-based string cursors. Sessions are ordered
+    (created_at ASC, id ASC); events are ordered (event_index ASC, id ASC).
+    insert_event must be idempotent (upsert on event.id).
+    update_session must be idempotent (upsert on session.id).
+    event_index is a per-session monotonic int from 1; the SDK client allocates
+    indices, drivers store whatever index is given.
+
+    Implement this Protocol to back SandboxAgent with a durable store
+    (PostgreSQL, SQLite, IndexedDB, etc.). Pass an instance via
+    SandboxAgent(persistence=...), SandboxAgent.connect(persistence=...), or
+    SandboxAgent.start(persistence=...).
+    """
+
+    async def get_session(self, session_id: str) -> SessionRecord | None: ...
+
+    async def list_sessions(
+        self, *, cursor: str | None = None, limit: int | None = None
+    ) -> "ListPage[SessionRecord]": ...
+
+    async def update_session(self, session: SessionRecord) -> None: ...
+
+    async def list_events(
+        self, session_id: str, *, cursor: str | None = None, limit: int | None = None
+    ) -> "ListPage[SessionEvent]": ...
+
+    async def insert_event(self, session_id: str, event: SessionEvent) -> None: ...
 
 
 class InMemorySessionPersistDriver:
